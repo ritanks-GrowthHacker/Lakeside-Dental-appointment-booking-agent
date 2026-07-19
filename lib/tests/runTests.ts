@@ -189,6 +189,153 @@ section("agent write recovery");
   check("recovery reply is stored in conversation history", turn.history.at(-1)?.role === "assistant");
 }
 
+section("agent scheduling context regression");
+{
+  seedStore();
+  const date = dates.find((candidate) => listAvailableSlotsForDate(candidate).length >= 2)!;
+  const availability = toolGetAvailableSlots({ date });
+  const slots = (availability.data as any).availableSlots;
+  let capturedMessages: any[] = [];
+  const fakeClient = {
+    chat: {
+      completions: {
+        create: async (request: any) => {
+          capturedMessages = request.messages;
+          return {
+            choices: [{
+              message: {
+                role: "assistant",
+                content: "Please provide your full name and phone number.",
+              },
+            }],
+          };
+        },
+      },
+    },
+  } as unknown as OpenAI;
+
+  await runAgentTurn([
+    { role: "user", content: "What is available tomorrow?" },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [{
+        id: "call_previous_availability",
+        type: "function",
+        function: { name: "get_available_slots", arguments: JSON.stringify({ date }) },
+      }],
+    },
+    {
+      role: "tool",
+      tool_call_id: "call_previous_availability",
+      content: JSON.stringify(availability),
+    },
+    { role: "assistant", content: "Here are the available appointments." },
+    { role: "user", content: "I want the second available appointment." },
+  ], fakeClient);
+
+  const authoritativeContext = capturedMessages
+    .filter((message) => message.role === "system")
+    .map((message) => message.content)
+    .join("\n");
+  check("ordinal selection inherits the date from the latest availability", authoritativeContext.includes(date));
+  check("ordinal selection resolves to the exact second slot", authoritativeContext.includes(slots[1].slotId));
+  check("ordinal selection tells the model not to ask for the date again", authoritativeContext.includes("Do not ask for the date or time again"));
+}
+
+section("stale selection regression");
+{
+  seedStore();
+  const date = dates.find((candidate) => listAvailableSlotsForDate(candidate).length > 0)!;
+  const availability = toolGetAvailableSlots({ date });
+  const selected = (availability.data as any).availableSlots[0];
+  const booked = toolBookAppointment({
+    slotId: selected.slotId,
+    name: "Ritank Saxena",
+    phone: "9399039501",
+  });
+  check("stale-selection setup booking succeeds", booked.ok === true);
+
+  let providerCalled = false;
+  const fakeClient = {
+    chat: {
+      completions: {
+        create: async () => {
+          providerCalled = true;
+          throw new Error("provider should not be needed for a deterministic stale-slot rejection");
+        },
+      },
+    },
+  } as unknown as OpenAI;
+
+  const hour = Number(selected.time.slice(0, 2));
+  const minute = selected.time.slice(3);
+  const displayTime = hour > 12
+    ? `${hour - 12}:${minute} PM`
+    : `${hour}:${minute} AM`;
+  const turn = await runAgentTurn([
+    { role: "user", content: "What appointments are available?" },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [{
+        id: "call_stale_availability",
+        type: "function",
+        function: { name: "get_available_slots", arguments: JSON.stringify({ date }) },
+      }],
+    },
+    {
+      role: "tool",
+      tool_call_id: "call_stale_availability",
+      content: JSON.stringify(availability),
+    },
+    { role: "assistant", content: "Here are the available appointments." },
+    { role: "user", content: `I want ${displayTime}.` },
+  ], fakeClient);
+
+  check("a stale requested time is rejected before asking for patient details", turn.reply.includes("no longer available"));
+  check("stale selection rejection does not depend on model behavior", providerCalled === false);
+}
+
+section("deferred response guard");
+{
+  seedStore();
+  const date = dates.find((candidate) => listAvailableSlotsForDate(candidate).length > 0)!;
+  let callCount = 0;
+  const fakeClient = {
+    chat: {
+      completions: {
+        create: async () => {
+          callCount++;
+          if (callCount === 1) {
+            return { choices: [{ message: { role: "assistant", content: "One moment please, let me check." } }] };
+          }
+          if (callCount === 2) {
+            return {
+              choices: [{
+                message: {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: [{
+                    id: "call_after_deferred_reply",
+                    type: "function",
+                    function: { name: "get_available_slots", arguments: JSON.stringify({ date }) },
+                  }],
+                },
+              }],
+            };
+          }
+          return { choices: [{ message: { role: "assistant", content: "Here are the current openings." } }] };
+        },
+      },
+    },
+  } as unknown as OpenAI;
+
+  const turn = await runAgentTurn([{ role: "user", content: "What is available tomorrow?" }], fakeClient);
+  check("agent does not return a one-moment placeholder", turn.reply === "Here are the current openings.");
+  check("agent continues into the tool call during the same turn", callCount === 3);
+}
+
 console.log(`\n${passed} passed, ${failed} failed\n`);
 process.exit(failed > 0 ? 1 : 0);
 }

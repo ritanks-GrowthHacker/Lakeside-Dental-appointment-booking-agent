@@ -8,7 +8,7 @@ The project is intentionally focused on one question: how should an LLM particip
 
 ### Requirements
 
-- Node.js 20 or newer
+- Node.js 22
 - An OpenAI API key
 
 Create a local environment file from the example and add your key:
