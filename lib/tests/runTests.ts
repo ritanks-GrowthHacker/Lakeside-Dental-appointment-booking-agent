@@ -192,29 +192,23 @@ section("agent write recovery");
 section("agent scheduling context regression");
 {
   seedStore();
-  const date = dates.find((candidate) => listAvailableSlotsForDate(candidate).length >= 2)!;
+  const date = dates.slice(1).find((candidate) => listAvailableSlotsForDate(candidate).length >= 2)!;
   const availability = toolGetAvailableSlots({ date });
   const slots = (availability.data as any).availableSlots;
-  let capturedMessages: any[] = [];
+  let providerCalled = false;
   const fakeClient = {
     chat: {
       completions: {
-        create: async (request: any) => {
-          capturedMessages = request.messages;
-          return {
-            choices: [{
-              message: {
-                role: "assistant",
-                content: "Please provide your full name and phone number.",
-              },
-            }],
-          };
+        create: async () => {
+          providerCalled = true;
+          throw new Error("ordinal selection should be deterministic");
         },
       },
     },
   } as unknown as OpenAI;
+  const schedulingState: { selectedDate?: string; selectedTime?: string; selectedSlotId?: string } = {};
 
-  await runAgentTurn([
+  const turn = await runAgentTurn([
     { role: "user", content: "What is available tomorrow?" },
     {
       role: "assistant",
@@ -232,15 +226,69 @@ section("agent scheduling context regression");
     },
     { role: "assistant", content: "Here are the available appointments." },
     { role: "user", content: "I want the second available appointment." },
-  ], fakeClient);
+  ], fakeClient, schedulingState);
 
-  const authoritativeContext = capturedMessages
-    .filter((message) => message.role === "system")
-    .map((message) => message.content)
-    .join("\n");
-  check("ordinal selection inherits the date from the latest availability", authoritativeContext.includes(date));
-  check("ordinal selection resolves to the exact second slot", authoritativeContext.includes(slots[1].slotId));
-  check("ordinal selection tells the model not to ask for the date again", authoritativeContext.includes("Do not ask for the date or time again"));
+  check("ordinal selection inherits the date from the latest availability", schedulingState.selectedDate === date);
+  check("ordinal selection resolves to the exact second slot", schedulingState.selectedSlotId === slots[1].slotId);
+  check("ordinal selection returns the correct date without model interpretation", turn.reply.includes(date));
+  check("ordinal selection does not depend on model behavior", providerCalled === false);
+}
+
+section("stored selection cannot drift to today");
+{
+  seedStore();
+  const date = dates.slice(1).find((candidate) => listAvailableSlotsForDate(candidate).length > 0)!;
+  const slot = listAvailableSlotsForDate(date)[0];
+  const schedulingState = {
+    selectedDate: date,
+    selectedTime: slot.time,
+    selectedSlotId: slot.id,
+  };
+  let callCount = 0;
+  let toolResultDate: string | undefined;
+  const fakeClient = {
+    chat: {
+      completions: {
+        create: async (request: any) => {
+          callCount++;
+          if (callCount === 1) {
+            return {
+              choices: [{
+                message: {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: [{
+                    id: "call_wrong_today",
+                    type: "function",
+                    function: {
+                      name: "get_available_slots",
+                      arguments: JSON.stringify({ date: dates[0] }),
+                    },
+                  }],
+                },
+              }],
+            };
+          }
+          const toolMessage = request.messages.findLast((message: any) => message.role === "tool");
+          toolResultDate = JSON.parse(toolMessage.content).data.date;
+          return {
+            choices: [{
+              message: {
+                role: "assistant",
+                content: `Your selected appointment remains ${date} at ${slot.time}.`,
+              },
+            }],
+          };
+        },
+      },
+    },
+  } as unknown as OpenAI;
+
+  const turn = await runAgentTurn([
+    { role: "user", content: "My name is Ritank Saxena and my phone is 9399039501." },
+  ], fakeClient, schedulingState);
+  check("model availability calls are forced to the stored selected date", toolResultDate === date);
+  check("stored tomorrow selection remains tomorrow in the response", turn.reply.includes(date));
 }
 
 section("stale selection regression");

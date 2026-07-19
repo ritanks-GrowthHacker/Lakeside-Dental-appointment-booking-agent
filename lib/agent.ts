@@ -3,6 +3,7 @@ import { toolSchemas } from "./toolSchemas";
 import { runTool, ToolName } from "./tools";
 import { buildSystemPrompt } from "./systemPrompt";
 import { getWindowDates, listAvailableSlotsForDate } from "./store";
+import { SchedulingState } from "./sessions";
 
 type ChatMessage = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
@@ -27,6 +28,7 @@ interface AvailabilityContext {
 interface SelectionPreflight {
   systemContext?: string;
   unavailableReply?: string;
+  selectionReply?: string;
   resolvedDate?: string;
 }
 
@@ -53,10 +55,11 @@ function getClient(): OpenAI {
 export async function runAgentTurn(
   history: ChatMessage[],
   openai: OpenAI = getClient(),
+  schedulingState: SchedulingState = {},
 ): Promise<{ reply: string; history: ChatMessage[] }> {
   const updatedHistory = [...history];
   const completedActions: CompletedAction[] = [];
-  const preflight = buildSelectionPreflight(history);
+  const preflight = buildSelectionPreflight(history, schedulingState);
 
   // A selected time is checked in deterministic code before the model can
   // collect details or reuse a stale slot from conversation history.
@@ -66,6 +69,16 @@ export async function runAgentTurn(
       history: [
         ...updatedHistory,
         { role: "assistant", content: preflight.unavailableReply } as ChatMessage,
+      ],
+    };
+  }
+
+  if (preflight.selectionReply) {
+    return {
+      reply: preflight.selectionReply,
+      history: [
+        ...updatedHistory,
+        { role: "assistant", content: preflight.selectionReply } as ChatMessage,
       ],
     };
   }
@@ -115,7 +128,11 @@ export async function runAgentTurn(
       const deferred = DEFERRED_REPLY_RE.test(reply);
       const forgotResolvedDate =
         Boolean(preflight.resolvedDate) && REDUNDANT_DATE_QUESTION_RE.test(reply);
-      if (deferred || forgotResolvedDate) {
+      const contradictedSelectedDate =
+        Boolean(schedulingState.selectedDate) &&
+        schedulingState.selectedDate !== getWindowDates()[0] &&
+        /\btoday\b/i.test(reply);
+      if (deferred || forgotResolvedDate || contradictedSelectedDate) {
         messages.push(message);
         messages.push({
           role: "system",
@@ -148,6 +165,16 @@ export async function runAgentTurn(
         // instead of crashing the request.
       }
 
+
+      // Once application code has resolved a selection, the model cannot
+      // silently switch its date or reuse another slot from older history.
+      if (toolCall.function.name === "get_available_slots" && schedulingState.selectedDate) {
+        args.date = schedulingState.selectedDate;
+      }
+      if (toolCall.function.name === "book_appointment" && schedulingState.selectedSlotId) {
+        args.slotId = schedulingState.selectedSlotId;
+      }
+
       const result = runTool(toolCall.function.name as ToolName, args);
 
       if (
@@ -158,6 +185,9 @@ export async function runAgentTurn(
           name: toolCall.function.name,
           result: (result.data || {}) as Record<string, unknown>,
         });
+        schedulingState.selectedDate = undefined;
+        schedulingState.selectedTime = undefined;
+        schedulingState.selectedSlotId = undefined;
       }
 
       const toolMessage: ChatMessage = {
@@ -181,7 +211,10 @@ export async function runAgentTurn(
   };
 }
 
-function buildSelectionPreflight(history: ChatMessage[]): SelectionPreflight {
+function buildSelectionPreflight(
+  history: ChatMessage[],
+  schedulingState: SchedulingState,
+): SelectionPreflight {
   const userMessage = getLatestUserText(history);
   if (!userMessage) return {};
 
@@ -208,9 +241,29 @@ function buildSelectionPreflight(history: ChatMessage[]): SelectionPreflight {
 
   if (!requestedTime) {
     if (explicitDate && previousAvailability?.date !== explicitDate) {
+      schedulingState.selectedDate = undefined;
+      schedulingState.selectedTime = undefined;
+      schedulingState.selectedSlotId = undefined;
       return {
         resolvedDate: explicitDate,
         systemContext: `The patient explicitly selected ${explicitDate}. Call get_available_slots for that date now. Do not ask for the date again and do not reuse availability from another date.`,
+      };
+    }
+    if (
+      schedulingState.selectedDate &&
+      schedulingState.selectedTime &&
+      schedulingState.selectedSlotId
+    ) {
+      return {
+        resolvedDate: schedulingState.selectedDate,
+        systemContext: [
+          "AUTHORITATIVE ACTIVE SELECTION (stored by application code):",
+          `Date: ${schedulingState.selectedDate}`,
+          `Time: ${schedulingState.selectedTime}`,
+          `Internal slotId: ${schedulingState.selectedSlotId}`,
+          "Do not change or ask for the date/time. Use this exact slot when the patient confirms booking.",
+          previousAvailability ? describeAvailability(previousAvailability) : "",
+        ].join("\n"),
       };
     }
     return previousAvailability
@@ -233,6 +286,9 @@ function buildSelectionPreflight(history: ChatMessage[]): SelectionPreflight {
     : freshSlots.find((slot) => slot.time === requestedTime);
 
   if (!matchingSlot) {
+    schedulingState.selectedDate = undefined;
+    schedulingState.selectedTime = undefined;
+    schedulingState.selectedSlotId = undefined;
     const alternatives = freshSlots.map((slot) => slot.time);
     const alternativeText = alternatives.length
       ? ` The currently available times are: ${alternatives.join(", ")}.`
@@ -240,6 +296,17 @@ function buildSelectionPreflight(history: ChatMessage[]): SelectionPreflight {
     return {
       resolvedDate: targetDate,
       unavailableReply: `Sorry, ${requestedTime} on ${targetDate} is no longer available.${alternativeText}`,
+    };
+  }
+
+  schedulingState.selectedDate = targetDate;
+  schedulingState.selectedTime = requestedTime;
+  schedulingState.selectedSlotId = matchingSlot.slotId;
+
+  if (!hasLikelyPhoneNumber(userMessage)) {
+    return {
+      resolvedDate: targetDate,
+      selectionReply: `You selected ${targetDate} at ${requestedTime}. Please provide the patient's full name and phone number, then confirm that you want me to book it.`,
     };
   }
 
@@ -253,6 +320,14 @@ function buildSelectionPreflight(history: ChatMessage[]): SelectionPreflight {
       describeAvailability({ date: targetDate, availableSlots: freshSlots }),
     ].join("\n"),
   };
+}
+
+function hasLikelyPhoneNumber(message: string): boolean {
+  const candidates = message.match(/[+\d][\d\s().-]{5,20}/g) || [];
+  return candidates.some((candidate) => {
+    const digits = candidate.replace(/\D/g, "").length;
+    return digits >= 7 && digits <= 15;
+  });
 }
 
 function getLatestUserText(history: ChatMessage[]): string | undefined {

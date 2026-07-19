@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { runAgentTurn } from "@/lib/agent";
-import { getSessions } from "@/lib/sessions";
+import { getSchedulingStates, getSessions } from "@/lib/sessions";
 import { ChatRequestBody, ChatResponseBody } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -30,14 +30,21 @@ export async function POST(req: NextRequest) {
   }
 
   const sessions = getSessions();
+  const schedulingStates = getSchedulingStates();
+  const schedulingState = schedulingStates.get(body.sessionId) || {};
   const history = [
     ...(sessions.get(body.sessionId) || []),
     { role: "user" as const, content: body.message.trim() },
   ];
 
   try {
-    const { reply, history: updatedHistory } = await runAgentTurn(history);
+    const { reply, history: updatedHistory } = await runAgentTurn(
+      history,
+      undefined,
+      schedulingState,
+    );
     sessions.set(body.sessionId, updatedHistory);
+    schedulingStates.set(body.sessionId, schedulingState);
     const response: ChatResponseBody = { reply, sessionId: body.sessionId };
     return NextResponse.json(response);
   } catch (err) {
