@@ -23,9 +23,11 @@ export interface ToolResult {
 export interface ChatRequestBody {
   sessionId: string;
   message: string;
+  conversationToken?: string;
 }
 
 export interface ChatResponseBody {
   reply: string;
   sessionId: string;
+  conversationToken: string;
 }

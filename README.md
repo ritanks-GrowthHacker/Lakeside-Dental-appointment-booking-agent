@@ -23,6 +23,8 @@ On PowerShell, use `Copy-Item .env.example .env.local` instead of `cp`.
 
 The application will be available at [http://localhost:3000](http://localhost:3000). The model can be changed with `OPENAI_MODEL`; the default is `gpt-4o-mini`.
 
+`CLINIC_TIME_ZONE` controls date words such as "today" and "tomorrow" and defaults to `Asia/Kolkata`. Set `SESSION_SECRET` to a long random value in production; it signs the portable conversation state used across serverless instances.
+
 Before submitting changes, run:
 
 ```bash

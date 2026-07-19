@@ -31,13 +31,36 @@ const BUSINESS_HOURS = [
   "13:00", "13:30", "14:00", "14:30", "15:00", "15:30", "16:00", "16:30",
 ]; // lunch break 12:00-13:00
 
+const CLINIC_TIME_ZONE = process.env.CLINIC_TIME_ZONE || "Asia/Kolkata";
+
+function clinicDateParts(): { year: number; month: number; day: number } {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: CLINIC_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+  const value = (type: Intl.DateTimeFormatPartTypes) =>
+    Number(parts.find((part) => part.type === type)?.value);
+  return { year: value("year"), month: value("month"), day: value("day") };
+}
+
+function clinicCurrentMinutes(): number {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: CLINIC_TIME_ZONE,
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date());
+  const hours = Number(parts.find((part) => part.type === "hour")?.value);
+  const minutes = Number(parts.find((part) => part.type === "minute")?.value);
+  return hours * 60 + minutes;
+}
+
 function todayISO(offsetDays = 0): string {
-  const d = new Date();
-  d.setDate(d.getDate() + offsetDays);
-  const year = d.getFullYear();
-  const month = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
+  const { year, month, day } = clinicDateParts();
+  const shifted = new Date(Date.UTC(year, month - 1, day + offsetDays));
+  return shifted.toISOString().slice(0, 10);
 }
 
 function ensureCurrentSeed(): StoreState {
@@ -65,7 +88,10 @@ export function seedStore(): void {
     const fullyBooked = dayOffset === 3;
 
     BUSINESS_HOURS.forEach((time, i) => {
-      const id = uuid();
+      // Slot identity must be stable across serverless instances so a slot
+      // returned by one request still exists when the next request is routed
+      // to another process.
+      const id = `slot-${date}-${time.replace(":", "")}`;
       const seed = dayOffset * 100 + i;
       // Roughly a third of remaining slots are pre-booked so results look realistic.
       const preBooked = fullyBooked || seededPick(seed, 3) === 0;
@@ -75,7 +101,7 @@ export function seedStore(): void {
 
       if (preBooked) {
         const appt: Appointment = {
-          id: uuid(),
+          id: `seed-appointment-${date}-${time.replace(":", "")}`,
           slotId: id,
           name: "Existing Patient",
           phone: "555-0100",
@@ -98,8 +124,7 @@ export function isDateInWindow(date: string): boolean {
 }
 
 export function listAvailableSlotsForDate(date: string): Slot[] {
-  const now = new Date();
-  const currentMinutes = now.getHours() * 60 + now.getMinutes();
+  const currentMinutes = clinicCurrentMinutes();
   const today = todayISO();
 
   return Array.from(ensureCurrentSeed().slots.values())

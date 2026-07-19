@@ -31,6 +31,7 @@ export default function ChatApp() {
   const [input, setInput] = useState("");
   const [isSending, setIsSending] = useState(false);
   const sessionIdRef = useRef<string>("");
+  const conversationTokenRef = useRef<string>("");
   const scrollRef = useRef<HTMLDivElement>(null);
 
   if (!sessionIdRef.current) {
@@ -53,7 +54,11 @@ export default function ChatApp() {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId: sessionIdRef.current, message: trimmed }),
+        body: JSON.stringify({
+          sessionId: sessionIdRef.current,
+          message: trimmed,
+          conversationToken: conversationTokenRef.current || undefined,
+        }),
       });
 
       const data = await res.json();
@@ -66,6 +71,7 @@ export default function ChatApp() {
         return;
       }
 
+      conversationTokenRef.current = data.conversationToken;
       setMessages((prev) => [...prev, { id: newId(), role: "assistant", content: data.reply }]);
     } catch {
       setMessages((prev) => [

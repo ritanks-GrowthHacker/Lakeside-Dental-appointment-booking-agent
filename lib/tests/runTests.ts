@@ -8,6 +8,7 @@
 import { seedStore, getWindowDates, listAvailableSlotsForDate } from "../store";
 import { toolGetAvailableSlots, toolBookAppointment, toolCancelAppointment, toolFindAppointmentsByPhone } from "../tools";
 import { runAgentTurn } from "../agent";
+import { decodeSessionToken, encodeSessionToken } from "../sessionToken";
 import OpenAI from "openai";
 
 let passed = 0;
@@ -29,6 +30,42 @@ function section(title: string) {
 
 seedStore();
 const dates = getWindowDates();
+
+section("portable signed conversation state");
+{
+  const secret = "test-only-session-secret";
+  const capsule = {
+    version: 1 as const,
+    sessionId: "test_session_123",
+    history: [{ role: "user" as const, content: "What is available tomorrow?" }],
+    schedulingState: {
+      selectedDate: dates[1],
+      selectedTime: "09:30",
+      selectedSlotId: `slot-${dates[1]}-0930`,
+    },
+    issuedAt: Date.now(),
+  };
+  const token = encodeSessionToken(capsule, secret);
+  const decoded = decodeSessionToken(token, capsule.sessionId, secret);
+  check("signed state preserves conversation history across processes", decoded.history.length === 1);
+  check("signed state preserves the selected tomorrow date", decoded.schedulingState.selectedDate === dates[1]);
+
+  let tamperRejected = false;
+  try {
+    decodeSessionToken(`${token.slice(0, -1)}x`, capsule.sessionId, secret);
+  } catch {
+    tamperRejected = true;
+  }
+  check("tampered conversation state is rejected", tamperRejected);
+
+  let wrongSessionRejected = false;
+  try {
+    decodeSessionToken(token, "different_session", secret);
+  } catch {
+    wrongSessionRejected = true;
+  }
+  check("conversation state cannot be replayed under another session ID", wrongSessionRejected);
+}
 
 section("get_available_slots");
 {
@@ -232,6 +269,87 @@ section("agent scheduling context regression");
   check("ordinal selection resolves to the exact second slot", schedulingState.selectedSlotId === slots[1].slotId);
   check("ordinal selection returns the correct date without model interpretation", turn.reply.includes(date));
   check("ordinal selection does not depend on model behavior", providerCalled === false);
+}
+
+section("exact cross-instance tomorrow transcript");
+{
+  seedStore();
+  const date = dates[1];
+  const expectedSlots = listAvailableSlotsForDate(date);
+  let firstTurnCalls = 0;
+  const firstInstanceClient = {
+    chat: {
+      completions: {
+        create: async () => {
+          firstTurnCalls++;
+          if (firstTurnCalls === 1) {
+            return {
+              choices: [{
+                message: {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: [{
+                    id: "cross_instance_availability",
+                    type: "function",
+                    function: {
+                      name: "get_available_slots",
+                      arguments: JSON.stringify({ date }),
+                    },
+                  }],
+                },
+              }],
+            };
+          }
+          return {
+            choices: [{
+              message: {
+                role: "assistant",
+                content: `Here are the available appointment slots for ${date}.`,
+              },
+            }],
+          };
+        },
+      },
+    },
+  } as unknown as OpenAI;
+  const firstState = {};
+  const firstTurn = await runAgentTurn([
+    { role: "user", content: "What appointments are available tomorrow?" },
+  ], firstInstanceClient, firstState);
+  const token = encodeSessionToken({
+    version: 1,
+    sessionId: "cross_instance_session",
+    history: firstTurn.history,
+    schedulingState: firstState,
+    issuedAt: Date.now(),
+  }, "cross-instance-test-secret");
+
+  // Simulate the next serverless request landing in a freshly seeded process.
+  seedStore();
+  const restored = decodeSessionToken(
+    token,
+    "cross_instance_session",
+    "cross-instance-test-secret",
+  );
+  let secondProviderCalled = false;
+  const secondInstanceClient = {
+    chat: {
+      completions: {
+        create: async () => {
+          secondProviderCalled = true;
+          throw new Error("ordinal resolution must not depend on the second model call");
+        },
+      },
+    },
+  } as unknown as OpenAI;
+  const secondTurn = await runAgentTurn([
+    ...restored.history,
+    { role: "user", content: "I want the second available appointment." },
+  ], secondInstanceClient, restored.schedulingState);
+
+  check("cross-instance second selection keeps tomorrow", secondTurn.reply.includes(date));
+  check("cross-instance second selection keeps the second time", secondTurn.reply.includes(expectedSlots[1].time));
+  check("cross-instance ordinal response bypasses model drift", secondProviderCalled === false);
 }
 
 section("stored selection cannot drift to today");
