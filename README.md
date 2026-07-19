@@ -67,7 +67,8 @@ lib/
   tools.ts                       Validated application operations
   validation.ts                  Input and business-rule validation
   store.ts                       In-memory slots and appointments
-  sessions.ts                    Server-side conversation history
+  sessions.ts                    Structured scheduling state
+  sessionToken.ts                Signed portable conversation state
   tests/runTests.ts              Deterministic and mocked-agent tests
 ```
 
@@ -83,7 +84,9 @@ The model is responsible for understanding conversational requests, collecting m
 
 The model is not the source of truth for availability or successful state changes. Tool implementations validate their arguments and consult the store before booking or cancelling anything. A booking can only succeed when the referenced slot exists and is still open, so a stale conversation cannot override current application state.
 
-This boundary matters because availability may change between two messages. The assistant is instructed to perform a fresh availability check whenever a patient selects a time, including a time mentioned earlier in the same conversation.
+This boundary matters because availability may change between two messages. Application code performs a fresh availability check whenever a patient selects a time, including a time mentioned earlier in the same conversation.
+
+When a message cannot be resolved directly from an exact date, time, or numbered option, a separate structured-output step converts the patient's ordinary language into a constrained scheduling action. The possible date values are limited to the seven dates computed by application code. A deterministic state reducer then applies that action to the current selection and verifies availability. This lets the model understand expressions such as “move it to the following day but keep the same time” without giving it authority over booking-window rules or stored state.
 
 ### A direct tool-calling loop
 
@@ -91,11 +94,11 @@ The agent uses the OpenAI SDK directly. Each turn sends the server-held conversa
 
 The loop has a five-iteration limit so an unexpected model response cannot keep a request running indefinitely. If a booking or cancellation succeeds but the following model request fails, the server creates a deterministic confirmation from the successful tool result. This avoids leaving the patient uncertain about whether a write occurred.
 
-### Server-side conversation history
+### Signed conversation continuity
 
-The browser sends only a session ID and the newest message. Conversation history, including trusted tool results, remains on the server. This prevents a client from rewriting an earlier tool response and presenting fabricated availability to the model.
+The API returns a compressed, cryptographically signed conversation token containing history and structured scheduling state. The browser sends that opaque token with the next message. Any modification or attempt to use it with another session ID fails signature validation.
 
-For this exercise, sessions are stored in memory. Both session and appointment state are attached to `globalThis` so ordinary Next.js development hot reloads do not reset the demo unexpectedly.
+This makes conversational context portable across serverless instances without trusting client-edited history. An in-memory copy is still retained as a local-development convenience, while the signed token is authoritative when supplied.
 
 ### Four focused tools
 
@@ -141,7 +144,7 @@ The debug endpoints should be disabled or protected before any real deployment.
 
 This is an interview-sized implementation rather than a production clinical system. Its deliberate constraints are:
 
-- Appointments and sessions are held in memory and reset when the process restarts.
+- Appointments are held in memory and reset when the process restarts; conversation continuity is carried in signed tokens.
 - State is local to one server process and cannot be shared safely across multiple instances.
 - There is one clinic schedule with uniform 30-minute appointments.
 - Authentication, authorization, rate limiting, audit logging, and patient identity verification are not implemented.

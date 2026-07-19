@@ -38,7 +38,10 @@ export function toolGetAvailableSlots(args: { date?: unknown }): ToolResult {
     ok: true,
     data: {
       date,
-      availableSlots: slots.map((s) => ({ slotId: s.id, time: s.time })),
+      // `position` is the 1-based index the patient means when they say
+      // "the second one" / "#2" / "the third slot". Giving this explicitly
+      // means the model never has to count the array itself.
+      availableSlots: slots.map((s, i) => ({ position: i + 1, slotId: s.id, time: s.time })),
       count: slots.length,
     },
   };
