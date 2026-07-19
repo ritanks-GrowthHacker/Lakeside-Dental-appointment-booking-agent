@@ -220,8 +220,10 @@ function buildSelectionPreflight(
 
   const previousAvailability = getLatestAvailability(history);
   const ordinalIndex = extractOrdinalIndex(userMessage);
-  const explicitTime = extractTime(userMessage);
   const explicitDate = extractExplicitDate(userMessage);
+  const sameTimeRequested = /\bsame\s+(?:slot|time|appointment)\b/i.test(userMessage);
+  const explicitTime = extractTime(userMessage) ||
+    (sameTimeRequested ? schedulingState.selectedTime : undefined);
 
   let requestedTime = explicitTime;
   let targetDate = explicitDate || previousAvailability?.date;
@@ -417,8 +419,89 @@ function extractExplicitDate(message: string): string | undefined {
   const dates = getWindowDates();
   if (/\btoday\b/i.test(message)) return dates[0];
   if (/\btomorrow\b/i.test(message)) return dates[1];
+  if (/\bday after tomorrow\b/i.test(message)) return dates[2];
   const isoDate = message.match(/\b\d{4}-\d{2}-\d{2}\b/);
-  return isoDate?.[0];
+  if (isoDate) return isoDate[0];
+
+  const monthNames: Record<string, number> = {
+    january: 1, jan: 1,
+    february: 2, feb: 2,
+    march: 3, mar: 3,
+    april: 4, apr: 4,
+    may: 5,
+    june: 6, jun: 6,
+    july: 7, jul: 7,
+    august: 8, aug: 8,
+    september: 9, sep: 9, sept: 9,
+    october: 10, oct: 10,
+    november: 11, nov: 11,
+    december: 12, dec: 12,
+  };
+  const monthPattern = Object.keys(monthNames).join("|");
+  const namedMonth =
+    message.match(new RegExp(`\\b(${monthPattern})\\s+(\\d{1,2})(?:st|nd|rd|th)?\\b`, "i")) ||
+    message.match(new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(?:of\\s+)?(${monthPattern})\\b`, "i"));
+  if (namedMonth) {
+    const firstIsMonth = monthNames[namedMonth[1].toLowerCase()] !== undefined;
+    const month = firstIsMonth
+      ? monthNames[namedMonth[1].toLowerCase()]
+      : monthNames[namedMonth[2].toLowerCase()];
+    const day = Number(firstIsMonth ? namedMonth[2] : namedMonth[1]);
+    const match = dates.find((date) => {
+      const [, candidateMonth, candidateDay] = date.split("-").map(Number);
+      return candidateMonth === month && candidateDay === day;
+    });
+    if (match) return match;
+  }
+
+  const numericDate = message.match(/\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b/);
+  if (numericDate) {
+    const first = Number(numericDate[1]);
+    const second = Number(numericDate[2]);
+    const candidates = dates.filter((date) => {
+      const [year, month, day] = date.split("-").map(Number);
+      const suppliedYear = numericDate[3]
+        ? Number(numericDate[3].length === 2 ? `20${numericDate[3]}` : numericDate[3])
+        : year;
+      if (year !== suppliedYear) return false;
+      return (month === first && day === second) || (day === first && month === second);
+    });
+    if (candidates.length === 1) return candidates[0];
+  }
+
+  const weekdays: Record<string, number> = {
+    sunday: 0,
+    monday: 1,
+    tuesday: 2,
+    wednesday: 3,
+    thursday: 4,
+    friday: 5,
+    saturday: 6,
+  };
+  const weekdayMatch = message.match(/\b(?:next\s+)?(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/i);
+  if (weekdayMatch) {
+    const weekday = weekdays[weekdayMatch[1].toLowerCase()];
+    const startIndex = /\bnext\s+/i.test(weekdayMatch[0]) ? 1 : 0;
+    const match = dates.slice(startIndex).find(
+      (date) => new Date(`${date}T00:00:00Z`).getUTCDay() === weekday,
+    );
+    if (match) return match;
+  }
+
+  // In an active scheduling conversation, phrases such as "for 22", "on
+  // the 22nd", or "22 same slot" mean the day of month within the current
+  // seven-day window. Restricting the pattern to date language avoids reading
+  // a phone number as a date.
+  const bareDay = message.match(
+    /(?:\b(?:for|on|date)\s+(?:the\s+)?|^\s*)([1-9]|[12]\d|3[01])(?:st|nd|rd|th)?(?=\s+(?:same\s+(?:slot|time|appointment)|at\b)|\s*$|[,.!?])/i,
+  );
+  if (bareDay) {
+    const day = Number(bareDay[1]);
+    const matches = dates.filter((date) => Number(date.slice(-2)) === day);
+    if (matches.length === 1) return matches[0];
+  }
+
+  return undefined;
 }
 
 function describeAvailability(context: AvailabilityContext): string {

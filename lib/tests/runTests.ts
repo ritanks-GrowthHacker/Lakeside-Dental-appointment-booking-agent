@@ -409,6 +409,46 @@ section("stored selection cannot drift to today");
   check("stored tomorrow selection remains tomorrow in the response", turn.reply.includes(date));
 }
 
+section("change date while keeping the same time");
+{
+  seedStore();
+  const originalDate = dates[1];
+  const targetDate = dates[2];
+  const targetSlots = listAvailableSlotsForDate(targetDate);
+  const originalSlots = listAvailableSlotsForDate(originalDate);
+  const commonTime = originalSlots.find((slot) =>
+    targetSlots.some((target) => target.time === slot.time),
+  )!;
+  const schedulingState = {
+    selectedDate: originalDate,
+    selectedTime: commonTime.time,
+    selectedSlotId: commonTime.id,
+  };
+  let providerCalled = false;
+  const fakeClient = {
+    chat: {
+      completions: {
+        create: async () => {
+          providerCalled = true;
+          throw new Error("same-time date changes should resolve deterministically");
+        },
+      },
+    },
+  } as unknown as OpenAI;
+  const dayOfMonth = Number(targetDate.slice(-2));
+  const turn = await runAgentTurn([
+    {
+      role: "user",
+      content: `no i think lets book for ${dayOfMonth} same slot`,
+    },
+  ], fakeClient, schedulingState);
+
+  check("bare day-of-month changes to the intended in-window date", schedulingState.selectedDate === targetDate);
+  check("same slot keeps the previously selected time", schedulingState.selectedTime === commonTime.time);
+  check("date-change response states the new date", turn.reply.includes(targetDate));
+  check("same-time date change does not depend on model date reasoning", providerCalled === false);
+}
+
 section("stale selection regression");
 {
   seedStore();
